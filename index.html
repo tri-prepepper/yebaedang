@@ -527,7 +527,7 @@ function toast(t,ms=3200){const e=$('toast');e.innerHTML=t;e.style.opacity=1;cle
 let avatar=0;
 document.querySelectorAll('.av').forEach(b=>b.onclick=()=>{document.querySelectorAll('.av').forEach(x=>x.classList.remove('on'));b.classList.add('on');avatar=+b.dataset.k;setAvatar(avatar)});
 $('myname').value=store.get('ybd_name','');
-$('enter').onclick=()=>{myName=($('myname').value.trim()||'순례자').slice(0,10);store.set('ybd_name',$('myname').value.trim());myAvatar=avatar;$('intro').classList.add('hide');connect(0);frozen=false;bellSound();if(musicOn)startPad();
+$('enter').onclick=()=>{myName=($('myname').value.trim()||'순례자').slice(0,10);store.set('ybd_name',$('myname').value.trim());myAvatar=avatar;$('intro').classList.add('hide');connect();frozen=false;bellSound();if(musicOn)startPad();
   $('hint').textContent=isTouch?'⚔️ 공격 · 옆 버튼으로 무기 변경 · 💬 채팅':'클릭·F 공격 · 1~5 무기 · Enter 채팅 · E 상호작용';
   setTimeout(()=>$('hint').style.opacity=0,7000)};
 
@@ -589,27 +589,35 @@ $('act').onclick=doAct;
 const TOPIC='yebaedang/v1/main';
 const BROKERS=['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt'];
 const myId=Math.random().toString(36).slice(2,10);
-let client=null,online=false,myName='순례자',myAvatar=0;
+let online=false,myName='순례자',myAvatar=0;
 const peers=new Map();
 const EMO=['🙏','👋','🕊️'];
 function setNet(text,on){$('onlineText').textContent=text;$('online').classList.toggle('on',!!on)}
-function updateCount(){if(online)setNet(peers.size?`지금 ${peers.size+1}명이 함께 있어요`:'지금은 혼자 머물고 있어요',true)}
-function connect(bi){
-  if(!window.mqtt){setNet('혼자 머무는 중 (연결 불가)');return}
-  if(bi>=BROKERS.length*2){setNet('혼자 머무는 중 (연결 불가)');return}
-  setNet('연결 중…');let ok=false;
-  try{client=mqtt.connect(BROKERS[bi%BROKERS.length],{clientId:'ybd_'+myId+'_'+bi,clean:true,keepalive:30,reconnectPeriod:5000,connectTimeout:8000,
-    will:{topic:TOPIC+'/bye',payload:myId,qos:0,retain:false}})}catch(e){connect(bi+1);return}
-  client.on('connect',()=>{ok=true;online=true;connectedAt=performance.now();client.subscribe([TOPIC+'/s',TOPIC+'/e',TOPIC+'/bye']);lastSent=0;sendState(true);sendEvent({type:'hi'});updateCount()});
-  client.on('close',()=>{if(online){online=false;setNet('다시 연결 중…')}});
-  client.on('message',(topic,buf)=>{const str=buf.toString();
-    if(topic.endsWith('/bye')){removePeer(str.slice(0,16));return}
-    if(str.length>700)return;let m;try{m=JSON.parse(str)}catch(e){return}
-    if(!m||typeof m.id!=='string'||m.id===myId||m.id.length>16)return;
-    if(topic.endsWith('/s'))onState(m);else if(topic.endsWith('/e'))onEvent(m)});
-  setTimeout(()=>{if(!ok){try{client.end(true)}catch(e){}connect(bi+1)}},10000);
-}
-function pub(sub,obj){if(online&&client)try{client.publish(TOPIC+sub,JSON.stringify(obj))}catch(e){}}
+function updateCount(){if(!online)return;const n=conns.filter(k=>k.ok).length;setNet((peers.size?`지금 ${peers.size+1}명이 함께 있어요`:'지금은 혼자예요 · 연결됨')+` (${n}/${conns.length})`,true)}
+// 모든 방문자가 두 서버에 동시에 접속해 같은 메시지를 양쪽으로 보낸다 (서버가 갈라져도 만날 수 있도록)
+const conns=[],recent=new Map();let seq=0;
+function connect(){
+  if(!window.mqtt){setNet('연결 불가 · 새로고침해 주세요');return}
+  setNet('연결 중…');
+  BROKERS.forEach((url,i)=>{let c;
+    try{c=mqtt.connect(url,{clientId:'ybd_'+myId+'_'+i+'_'+Math.random().toString(36).slice(2,6),clean:true,keepalive:30,reconnectPeriod:4000,connectTimeout:12000,
+      will:{topic:TOPIC+'/bye',payload:myId,qos:0,retain:false}})}catch(e){return}
+    const k={c,ok:false,url};conns.push(k);
+    c.on('connect',()=>{k.ok=true;c.subscribe([TOPIC+'/s',TOPIC+'/e',TOPIC+'/bye']);
+      if(!online){online=true;connectedAt=performance.now();lastSent=0;sendState(true);sendEvent({type:'hi'})}else{lastSent=0;sendState(true)}updateCount()});
+    c.on('close',()=>{k.ok=false;online=conns.some(x=>x.ok);if(!online)setNet('다시 연결 중…');else updateCount()});
+    c.on('error',()=>{});
+    c.on('message',onMsg)});
+  setTimeout(()=>{if(!online)setNet('서버 연결 안 됨 · 네트워크를 확인해 주세요')},15000)}
+function onMsg(topic,buf){const str=buf.toString();
+  if(topic.endsWith('/bye')){removePeer(str.slice(0,16));return}
+  if(str.length>700)return;
+  const now=performance.now();if(recent.has(str))return;recent.set(str,now);  // 양쪽 서버에서 온 같은 메시지는 한 번만
+  if(recent.size>400)for(const [k,t] of recent)if(now-t>6000)recent.delete(k);
+  let m;try{m=JSON.parse(str)}catch(e){return}
+  if(!m||typeof m.id!=='string'||m.id===myId||m.id.length>16)return;
+  if(topic.endsWith('/s'))onState(m);else if(topic.endsWith('/e'))onEvent(m)}
+function pub(sub,obj){obj.q=++seq;const str=JSON.stringify(obj);for(const k of conns)if(k.ok)try{k.c.publish(TOPIC+sub,str)}catch(e){}}
 let lastSent=0,lastX=0,lastZ=0,lastR=0,lastS=false,lastSig='';
 function sendState(force){const p=player.position,now=performance.now(),s=!!sitting,sig=myHp+'|'+myW+'|'+myStatus+'|'+myKills;
   const changed=Math.abs(p.x-lastX)>.03||Math.abs(p.z-lastZ)>.03||Math.abs(player.rotation.y-lastR)>.05||s!==lastS||sig!==lastSig;
@@ -831,7 +839,7 @@ function sendChat(){const t=$('chatin').value.replace(/\s+/g,' ').trim().slice(0
 $('chatin').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();if(e.isComposing||e.keyCode===229)return;sendChat()}else if(e.key==='Escape'){e.preventDefault();closeChat()}});
 $('chatsend').onclick=()=>{sendChat();if(isTouch)$('chatin').focus()};
 $('chatbtn').onclick=()=>{$('chatbar').classList.contains('show')?closeChat():openChat()};
-addEventListener('pagehide',()=>{if(online)try{client.publish(TOPIC+'/bye',myId);client.end(true)}catch(e){}});
+addEventListener('pagehide',()=>{for(const k of conns)try{if(k.ok)k.c.publish(TOPIC+'/bye',myId);k.c.end(true)}catch(e){}});
 
 /* ---------- 루프 ---------- */
 let camDist=6.2;const camPos=new THREE.Vector3(0,4,18),look=new THREE.Vector3();
